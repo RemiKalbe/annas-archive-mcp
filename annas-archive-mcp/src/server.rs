@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use annas_archive_api::{AnnasArchiveClient, SearchOptions};
+use annas_archive_api::{AnnasArchiveClient, Error, SearchOptions};
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -36,7 +36,7 @@ impl ServerHandler for AnnasArchiveServer {
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             server_info: Implementation::from_build_env(),
             instructions: Some(
-                "Access Anna's Archive to search for and get information about books, papers, magazines, comics, and other documents. Use get_download_url only if you have an API key configured.".to_string()
+                "Access Anna's Archive to search for and get information about books, papers, magazines, comics, and other documents. get_details and get_download_url require the ANNAS_ARCHIVE_API_KEY environment variable. If search is blocked by the browser check, call pass_browser_check and search again.".to_string()
             ),
         }
     }
@@ -65,8 +65,25 @@ impl AnnasArchiveServer {
                 })?;
                 Ok(CallToolResult::success(vec![Content::text(json)]))
             }
+            Err(Error::BrowserCheck) => Ok(CallToolResult::error(vec![Content::text(
+                "Search failed: blocked by Anna's Archive's browser check. Call pass_browser_check so the user can pass it in a browser window, then search again.",
+            )])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Search failed: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        description = "Open a browser window where the user passes Anna's Archive's browser check. Call this when search reports being blocked by the browser check, then search again. Waits up to 2 minutes for the user and needs them at the computer."
+    )]
+    async fn pass_browser_check(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        match self.client.pass_browser_check().await {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(
+                "Browser check passed. Searches will work for about 15 minutes.",
+            )])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Browser check failed: {e}"
             ))])),
         }
     }

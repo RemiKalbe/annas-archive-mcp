@@ -14,8 +14,14 @@ pub enum Error {
     #[error("API error: {message}")]
     Api { message: String },
 
-    #[error("Missing API key - required for download URLs")]
+    #[error("Missing API key - set ANNAS_ARCHIVE_API_KEY to your account's secret key")]
     MissingApiKey,
+
+    #[error("Blocked by Anna's Archive's browser check")]
+    BrowserCheck,
+
+    #[error("Browser error: {message}")]
+    Browser { message: String },
 
     #[error("All domains failed: {message}")]
     AllDomainsFailed { message: String },

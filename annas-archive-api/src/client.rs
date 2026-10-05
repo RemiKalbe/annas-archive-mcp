@@ -1,21 +1,34 @@
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use reqwest::{Client, cookie::Jar};
 
+use crate::browser;
 use crate::error::Error;
 use crate::scraper::parse_search_results;
 use crate::types::{
     DownloadInfo, DownloadSource, Identifiers, IpfsInfo, ItemDetails, SearchOptions, SearchResponse,
 };
 
-const DOMAINS: &[&str] = &["annas-archive.org", "annas-archive.se", "annas-archive.li"];
+/// Official mirrors, in order of preference.
+const DOMAINS: &[&str] = &["annas-archive.gd", "annas-archive.gl", "annas-archive.pk"];
+
+/// Cookie holding the logged-in session.
+const ACCOUNT_COOKIE: &str = "aa_account_id2";
+
+/// How long the user gets to pass the browser check.
+const BROWSER_CHECK_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct AnnasArchiveClient {
     client: Client,
     api_key: Option<String>,
-    #[allow(dead_code)] // Used by cookie_provider, but not directly accessed
     cookie_jar: Arc<Jar>,
-    authenticated: std::sync::atomic::AtomicBool,
+    /// Domains we have opened a session on. Cookies are scoped to a single
+    /// domain, so each mirror needs its own login.
+    sessions: Mutex<HashSet<&'static str>>,
+    /// The mirror that last sent us to the browser check.
+    challenged: Mutex<Option<&'static str>>,
 }
 
 impl AnnasArchiveClient {
@@ -32,78 +45,82 @@ impl AnnasArchiveClient {
             client,
             api_key,
             cookie_jar,
-            authenticated: std::sync::atomic::AtomicBool::new(false),
+            sessions: Mutex::new(HashSet::new()),
+            challenged: Mutex::new(None),
         }
     }
 
-    /// Authenticate with Anna's Archive using the secret key.
-    /// This sets the aa_account_id2 cookie needed for API access.
-    async fn authenticate(&self) -> Result<(), Error> {
-        let api_key = self.api_key.as_ref().ok_or(Error::MissingApiKey)?;
-
-        // Try each domain for authentication
-        for domain in DOMAINS {
-            let url = format!("https://{domain}/account/");
-
-            let response = self
-                .client
-                .post(&url)
+    /// Open a session on `domain`, logging in with the secret key if we have
+    /// one. Logging in sets the aa_account_id2 cookie needed for API access.
+    async fn open_session(&self, domain: &'static str) -> Result<(), Error> {
+        if let Some(api_key) = &self.api_key {
+            self.client
+                .post(format!("https://{domain}/account/"))
                 .form(&[("key", api_key.as_str())])
                 .send()
-                .await;
+                .await?;
+        }
 
-            match response {
-                Ok(resp) if resp.status().is_success() || resp.status().is_redirection() => {
-                    self.authenticated
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    return Ok(());
-                }
-                Ok(resp) if resp.status().is_client_error() => {
-                    return Err(Error::Api {
-                        message: "Invalid secret key".to_string(),
-                    });
-                }
-                _ => continue, // Try next domain
+        // The login page answers 200 even for a wrong key, and a seized or
+        // parked domain answers 200 for anything, so ask the site whether the
+        // login actually took.
+        let body = self
+            .client
+            .get(format!("https://{domain}/dyn/up/"))
+            .send()
+            .await?
+            .text()
+            .await?;
+
+        match parse_logged_in(&body) {
+            Some(false) if self.api_key.is_some() => Err(Error::Api {
+                message: "Invalid secret key".to_string(),
+            }),
+            Some(_) => {
+                self.sessions.lock().unwrap().insert(domain);
+                Ok(())
             }
+            None => Err(Error::AllDomainsFailed {
+                message: format!("{domain} is not serving Anna's Archive"),
+            }),
         }
-
-        Err(Error::AllDomainsFailed {
-            message: "Failed to authenticate with any domain".to_string(),
-        })
     }
 
-    async fn ensure_authenticated(&self) -> Result<(), Error> {
-        if !self.authenticated.load(std::sync::atomic::Ordering::SeqCst) {
-            self.authenticate().await?;
-        }
-        Ok(())
-    }
-
-    async fn fetch_with_failover(&self, path: &str) -> Result<String, Error> {
+    /// GET `path`, failing over to the next mirror on connection or server
+    /// errors.
+    async fn fetch(&self, path: &str) -> Result<reqwest::Response, Error> {
         let mut last_error = None;
 
         for domain in DOMAINS {
-            let url = format!("https://{domain}{path}");
-
-            match self.client.get(&url).send().await {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        return response.text().await.map_err(Error::Network);
-                    } else if response.status().is_client_error() {
-                        // Client errors (4xx) won't be fixed by trying another domain
-                        return Err(Error::Http {
-                            status: response.status().as_u16(),
-                        });
+            if !self.sessions.lock().unwrap().contains(domain) {
+                match self.open_session(domain).await {
+                    Ok(()) => {}
+                    // A rejected key won't be fixed by trying another domain
+                    Err(e @ Error::Api { .. }) => return Err(e),
+                    Err(e) => {
+                        last_error = Some(e);
+                        continue;
                     }
-                    // Server error - try next domain
+                }
+            }
+
+            match self
+                .client
+                .get(format!("https://{domain}{path}"))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_server_error() => {
                     last_error = Some(Error::Http {
                         status: response.status().as_u16(),
                     });
                 }
-                Err(e) => {
-                    // Connection error - try next domain
-                    last_error = Some(Error::Network(e));
+                Ok(response) if is_browser_check(&response) => {
+                    *self.challenged.lock().unwrap() = Some(domain);
+                    return Err(Error::BrowserCheck);
                 }
+                Ok(response) => return Ok(response),
+                Err(e) => last_error = Some(Error::Network(e)),
             }
         }
 
@@ -112,12 +129,22 @@ impl AnnasArchiveClient {
         }))
     }
 
+    /// Search the catalogue. Anna's Archive sends searches to a browser check
+    /// unless the API key belongs to a member allowed to skip it; see
+    /// [`Self::pass_browser_check`].
     pub async fn search(&self, options: SearchOptions) -> Result<SearchResponse, Error> {
         let page = options.page.unwrap_or(1);
         let query = urlencoding::encode(&options.query);
         let path = format!("/search?q={query}&page={page}");
 
-        let html = self.fetch_with_failover(&path).await?;
+        let response = self.fetch(&path).await?;
+        if !response.status().is_success() {
+            return Err(Error::Http {
+                status: response.status().as_u16(),
+            });
+        }
+
+        let html = response.text().await?;
         let (results, has_more) = parse_search_results(&html)?;
 
         Ok(SearchResponse {
@@ -127,53 +154,51 @@ impl AnnasArchiveClient {
         })
     }
 
-    /// Get detailed metadata for an item. Requires API key (secret key).
-    pub async fn get_details(&self, md5: &str) -> Result<ItemDetails, Error> {
-        self.ensure_authenticated().await?;
+    /// Open a browser window for the user to pass the browser check in, and
+    /// adopt the cookies that prove it. Anna's Archive honours them for about
+    /// 15 minutes.
+    pub async fn pass_browser_check(&self) -> Result<(), Error> {
+        let domain = self.challenged.lock().unwrap().unwrap_or(DOMAINS[0]);
+        let cookies = browser::pass_browser_check(domain, BROWSER_CHECK_TIMEOUT).await?;
 
-        let path = format!("/db/aarecord_elasticsearch/md5:{md5}.json");
-
-        let mut last_error = None;
-
-        for domain in DOMAINS {
-            let url = format!("https://{domain}{path}");
-
-            match self.client.get(&url).send().await {
-                Ok(response) => {
-                    if response.status().is_success() {
-                        let json_str = response.text().await.map_err(Error::Network)?;
-                        return parse_json_details(&json_str, md5);
-                    } else if response.status().is_client_error() {
-                        let status = response.status().as_u16();
-                        if status == 403 {
-                            // Re-authenticate and retry once
-                            self.authenticated
-                                .store(false, std::sync::atomic::Ordering::SeqCst);
-                            self.authenticate().await?;
-
-                            // Retry request
-                            if let Ok(resp) = self.client.get(&url).send().await
-                                && resp.status().is_success()
-                            {
-                                let json_str = resp.text().await.map_err(Error::Network)?;
-                                return parse_json_details(&json_str, md5);
-                            }
-                        }
-                        return Err(Error::Http { status });
-                    }
-                    last_error = Some(Error::Http {
-                        status: response.status().as_u16(),
-                    });
-                }
-                Err(e) => {
-                    last_error = Some(Error::Network(e));
-                }
+        let url = format!("https://{domain}/")
+            .parse()
+            .expect("Mirror domains are valid URLs");
+        for (name, value) in cookies {
+            // Keep the session we logged in with, not the browser's
+            if name != ACCOUNT_COOKIE {
+                let cookie = format!("{name}={value}; Domain={domain}; Path=/");
+                self.cookie_jar.add_cookie_str(&cookie, &url);
             }
         }
 
-        Err(last_error.unwrap_or(Error::AllDomainsFailed {
-            message: "Failed to get details from any domain".to_string(),
-        }))
+        Ok(())
+    }
+
+    /// Get detailed metadata for an item. Requires API key (secret key).
+    pub async fn get_details(&self, md5: &str) -> Result<ItemDetails, Error> {
+        if self.api_key.is_none() {
+            return Err(Error::MissingApiKey);
+        }
+
+        let path = format!("/db/aarecord_elasticsearch/md5:{md5}.json");
+
+        let mut response = self.fetch(&path).await?;
+
+        if response.status().as_u16() == 403 {
+            // The session may have expired: log in again and retry once
+            self.sessions.lock().unwrap().clear();
+            response = self.fetch(&path).await?;
+        }
+
+        if !response.status().is_success() {
+            return Err(Error::Http {
+                status: response.status().as_u16(),
+            });
+        }
+
+        let json_str = response.text().await?;
+        parse_json_details(&json_str, md5)
     }
 
     pub async fn get_download_url(
@@ -252,6 +277,24 @@ impl AnnasArchiveClient {
             message: "Failed to get download URL from any domain".to_string(),
         }))
     }
+}
+
+/// Parse the `/dyn/up/` login status. Returns `None` when the body is not the
+/// expected JSON, which means the domain is not serving Anna's Archive.
+fn parse_logged_in(body: &str) -> Option<bool> {
+    let data: serde_json::Value = serde_json::from_str(body).ok()?;
+    Some(data.get("aa_logged_in")?.as_u64()? == 1)
+}
+
+/// Whether a response is the browser check's challenge page rather than an
+/// answer from Anna's Archive, whose own 403s are JSON.
+fn is_browser_check(response: &reqwest::Response) -> bool {
+    response.status().as_u16() == 403
+        && response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/html"))
 }
 
 /// Parse item details from the JSON API response
@@ -601,5 +644,23 @@ fn format_filesize(bytes: u64) -> String {
         format!("{:.1}KB", bytes as f64 / KB as f64)
     } else {
         format!("{bytes}B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_logged_in() {
+        assert_eq!(parse_logged_in(r#"{"aa_logged_in":1}"#), Some(true));
+        assert_eq!(parse_logged_in(r#"{"aa_logged_in":0}"#), Some(false));
+    }
+
+    #[test]
+    fn test_parse_logged_in_rejects_foreign_pages() {
+        // What a parked domain serves for every path
+        assert_eq!(parse_logged_in("<html><head></head></html>"), None);
+        assert_eq!(parse_logged_in(r#"{"status":"ok"}"#), None);
     }
 }
