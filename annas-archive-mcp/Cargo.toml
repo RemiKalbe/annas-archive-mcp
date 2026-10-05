@@ -1,6 +1,6 @@
 [package]
 name = "annas-archive-mcp"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "MCP server for Anna's Archive - search and retrieve books, papers, and documents"
 license = "MIT"
@@ -9,7 +9,7 @@ keywords = ["annas-archive", "mcp", "books", "library"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-annas-archive-api = { version = "0.2.0", path = "../annas-archive-api" }
+annas-archive-api = { version = "0.3.0", path = "../annas-archive-api" }
 anyhow = "1.0"
 rmcp = { version = "0.14", features = ["server", "transport-io"] }
 schemars = "1.0"
