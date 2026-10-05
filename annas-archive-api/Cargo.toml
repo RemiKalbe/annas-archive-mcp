@@ -1,6 +1,6 @@
 [package]
 name = "annas-archive-api"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Rust client library for Anna's Archive - search and retrieve books, papers, and documents"
 license = "MIT"
