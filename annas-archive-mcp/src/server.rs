@@ -5,7 +5,8 @@ use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+        CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities,
+        ServerConfig,
     },
     tool, tool_handler, tool_router,
 };
@@ -30,15 +31,13 @@ impl AnnasArchiveServer {
 
 #[tool_handler]
 impl ServerHandler for AnnasArchiveServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            server_info: Implementation::from_build_env(),
-            instructions: Some(
-                "Access Anna's Archive to search for and get information about books, papers, magazines, comics, and other documents. get_details and get_download_url require the ANNAS_ARCHIVE_API_KEY environment variable. If search is blocked by the browser check, call pass_browser_check and search again.".to_string()
-            ),
-        }
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::V_2024_11_05)
+            .with_server_info(Implementation::from_build_env())
+            .with_instructions(
+                "Access Anna's Archive to search for and get information about books, papers, magazines, comics, and other documents. get_details and get_download_url require the ANNAS_ARCHIVE_API_KEY environment variable. If search is blocked by the browser check, call pass_browser_check and search again.",
+            )
     }
 }
 
@@ -63,12 +62,12 @@ impl AnnasArchiveServer {
                 let json = serde_json::to_string_pretty(&response).map_err(|e| {
                     rmcp::ErrorData::internal_error(format!("Serialize error: {e}"), None)
                 })?;
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
             }
-            Err(Error::BrowserCheck) => Ok(CallToolResult::error(vec![Content::text(
+            Err(Error::BrowserCheck) => Ok(CallToolResult::error(vec![ContentBlock::text(
                 "Search failed: blocked by Anna's Archive's browser check. Call pass_browser_check so the user can pass it in a browser window, then search again.",
             )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Search failed: {e}"
             ))])),
         }
@@ -79,10 +78,10 @@ impl AnnasArchiveServer {
     )]
     async fn pass_browser_check(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         match self.client.pass_browser_check().await {
-            Ok(()) => Ok(CallToolResult::success(vec![Content::text(
+            Ok(()) => Ok(CallToolResult::success(vec![ContentBlock::text(
                 "Browser check passed. Searches will work for about 15 minutes.",
             )])),
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Browser check failed: {e}"
             ))])),
         }
@@ -98,9 +97,9 @@ impl AnnasArchiveServer {
                 let json = serde_json::to_string_pretty(&details).map_err(|e| {
                     rmcp::ErrorData::internal_error(format!("Serialize error: {e}"), None)
                 })?;
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Failed to get details: {e}"
             ))])),
         }
@@ -122,9 +121,9 @@ impl AnnasArchiveServer {
                 let json = serde_json::to_string_pretty(&info).map_err(|e| {
                     rmcp::ErrorData::internal_error(format!("Serialize error: {e}"), None)
                 })?;
-                Ok(CallToolResult::success(vec![Content::text(json)]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
             }
-            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+            Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                 "Failed to get download URL: {e}"
             ))])),
         }
