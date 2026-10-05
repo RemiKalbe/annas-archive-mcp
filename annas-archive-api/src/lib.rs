@@ -1,3 +1,4 @@
+mod browser;
 mod client;
 mod error;
 mod scraper;
