@@ -1,6 +1,6 @@
 [package]
 name = "annas-archive-mcp"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "MCP server for Anna's Archive - search and retrieve books, papers, and documents"
 license = "MIT"

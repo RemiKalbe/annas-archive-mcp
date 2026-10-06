@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/RemiKalbe/annas-archive-mcp/compare/annas-archive-mcp-v0.1.2...annas-archive-mcp-v0.1.3) - 2026-10-05
+
+### Build
+
+- *(deps)* update dependencies and move to rmcp 3
+
 ## [0.1.2](https://github.com/RemiKalbe/annas-archive-mcp/compare/annas-archive-mcp-v0.1.1...annas-archive-mcp-v0.1.2) - 2026-10-05
 
 ### Feat
